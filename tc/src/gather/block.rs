@@ -302,9 +302,12 @@ impl<'a, 'b> BlockDecoder<'a, 'b> {
 
         if let Some(addr) = is_abs_memory_ref(&instr) {
             // `jmp [addr]` for some constant addr
-            if let Some(imp) = self.traverse.iat_refs.get(&addr) {
+            if let Some(imp) = self.traverse.iat_refs.get(&addr).filter(|imp| !imp.linked) {
                 // `call [foo@IAT]` means `call foo`, the IAT is the pointer to the real function.
                 new_instr.hint = Some(format!("{}::{}_stdcall", imp.dll, imp.func));
+            } else if self.traverse.iat_refs.contains_key(&addr) {
+                // Bound to a linked module: the IAT holds that module's real export
+                // address and its code is translated, so this stays an indirect call.
             } else {
                 if addr as usize + 4 > self.traverse.mem.bytes.len() {
                     anyhow::bail!("jmp to invalid address");
