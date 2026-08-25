@@ -1,0 +1,5 @@
+# 24MB of generated Rust across 38 files, an order of magnitude larger than
+# any other out/ target; regenerate with ./translate.sh instead of tracking it.
+/data/
+/src/generated.rs
+/src/generated/

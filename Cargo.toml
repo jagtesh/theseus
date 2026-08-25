@@ -10,6 +10,7 @@ members = [
   "out/chillin-unpack",
   "out/dos/magixfly",
   "out/hello6",
+  "out/mfc42",
   "out/mine",
   "out/mofo",
   "out/mofo-unpack",

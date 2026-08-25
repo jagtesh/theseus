@@ -55,6 +55,10 @@ struct Args {
     #[argh(option)]
     entry_points_file: Option<String>,
 
+    /// create a block at every address in the module's own PE export table
+    #[argh(switch)]
+    exports: bool,
+
     /// additional addresses containing pointers to code
     #[argh(option, from_str_fn(parse_ip_range))]
     jump_table: Vec<std::ops::Range<IP>>,
@@ -116,6 +120,32 @@ fn run() -> anyhow::Result<()> {
     state.init_system_hooks();
 
     let mut entry_points = vec![];
+    if args.exports {
+        let Module::Windows(module) = &state.module else {
+            anyhow::bail!("--exports requires a PE module");
+        };
+        let mut code = Vec::new();
+        let mut data = 0;
+        for export in &module.exports {
+            if state.module.exec_range(export.addr).is_none() {
+                data += 1;
+                continue;
+            }
+            code.push((export.addr, export.ident()));
+        }
+        log::info!(
+            "exports: {total} total, {code} in executable sections, {data} data",
+            total = module.exports.len(),
+            code = code.len(),
+        );
+        for (addr, name) in code {
+            entry_points.push(tc::EntryPoint::Single(IP::Flat(addr)));
+            state.addr_info.entry(addr).or_insert(AddrInfo {
+                name,
+                is_extern: false,
+            });
+        }
+    }
     for ip in args.entry_point {
         if matches!(ip, IP::Seg(_)) != state.module.segment_addressed() {
             anyhow::bail!("--entry-point {ip} must be ip");

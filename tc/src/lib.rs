@@ -27,11 +27,34 @@ pub struct WindowsModule {
     pub image_base: u32,
     pub entry_point: u32,
     pub code_memory: std::ops::Range<u32>,
+    /// Mapped ranges of the sections marked executable, sorted by address.
+    /// Distinct from code_memory, which spans them and any data section between.
+    pub exec_ranges: Vec<std::ops::Range<u32>>,
     pub resources: Option<std::ops::Range<u32>>,
     pub imports: Vec<Import>,
     pub vtables: Vec<(String, u32)>,
     /// (dll, function) pairs the program may resolve through GetProcAddress.
     pub dynamic_exports: Vec<(String, String)>,
+    /// The module's own PE export table.
+    pub exports: Vec<Export>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Export {
+    pub ordinal: u32,
+    /// Only a minority of exports are named: mfc42 names 6 of its 6,389.
+    pub name: Option<String>,
+    pub addr: u32,
+}
+
+impl Export {
+    /// Name for the generated function, unique across the export table.
+    pub fn ident(&self) -> String {
+        match &self.name {
+            Some(name) => exe::escape_symbol(name),
+            None => format!("ord_{}", self.ordinal),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +118,19 @@ impl Module {
         match self {
             Module::DOS(m) => m.code_memory.clone(),
             Module::Windows(m) => m.code_memory.clone(),
+        }
+    }
+
+    /// The executable region containing addr, if any.  A DOS image has no
+    /// section table to consult, so its whole loaded image counts.
+    pub fn exec_range(&self, addr: u32) -> Option<std::ops::Range<u32>> {
+        match self {
+            Module::DOS(m) => m.code_memory.contains(&addr).then(|| m.code_memory.clone()),
+            Module::Windows(m) => m
+                .exec_ranges
+                .iter()
+                .find(|r| r.contains(&addr))
+                .cloned(),
         }
     }
 }

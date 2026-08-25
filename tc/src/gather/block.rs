@@ -166,7 +166,16 @@ impl<'a, 'b> BlockDecoder<'a, 'b> {
         if block_addr > self.traverse.mem.bytes.len() as u32 {
             anyhow::bail!("ip out of bounds");
         }
-        let data = self.traverse.mem.slice_all(block_addr);
+        // A PE exports data as well as code -- mfc42 exports 279 addresses in
+        // .rdata/.data -- so an address handed to us is not necessarily code.
+        // Decoding is confined to the executable sections, because bytes past
+        // their end are not instructions and decode into nonsense that only
+        // stops once some byte pattern happens to look like control flow.
+        let Some(exec) = self.traverse.module.exec_range(block_addr) else {
+            anyhow::bail!("address is not in an executable section");
+        };
+        let end = (exec.end as usize).min(self.traverse.mem.bytes.len());
+        let data = &self.traverse.mem.bytes[block_addr as usize..end];
 
         let mut instrs = Vec::new();
         let mut decoder = iced_x86::Decoder::with_ip(
@@ -234,6 +243,13 @@ impl<'a, 'b> BlockDecoder<'a, 'b> {
                 _ => todo!("{ip} control flow {}", instr),
             }
             break;
+        }
+
+        let Some(last) = instrs.last() else {
+            anyhow::bail!("no instructions");
+        };
+        if !decoder.can_decode() && last.iced.flow_control() == iced_x86::FlowControl::Next {
+            anyhow::bail!("ran past the end of the executable section");
         }
 
         for (table, count) in self.found_tables.iter().copied() {
