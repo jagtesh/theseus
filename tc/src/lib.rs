@@ -330,10 +330,14 @@ fn resolve_linked(linked: &[(String, WindowsModule)], import: &Import) -> Option
             let ordinal: u32 = n.parse().ok()?;
             module.exports.iter().find(|e| e.ordinal == ordinal)?
         }
-        None => module
-            .exports
-            .iter()
-            .find(|e| e.name.as_deref() == Some(import.func.as_str()))?,
+        // Import names are escaped into legal Rust identifiers when they are read,
+        // while exports keep the raw name, so the comparison has to escape too:
+        // MFC imports msvcrt by mangled name, e.g. `?terminate@@YAXXZ`.
+        None => module.exports.iter().find(|e| {
+            e.name
+                .as_deref()
+                .is_some_and(|name| exe::escape_symbol(name) == import.func)
+        })?,
     };
     Some(export.addr)
 }
