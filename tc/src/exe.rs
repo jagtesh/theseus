@@ -109,7 +109,25 @@ fn read_imports(pe_file: &exe::PE, mem: &Memory) -> Vec<Import> {
         let name = name.trim_end_matches(".dll");
         for (addr, entry) in imp.iat_iter(image) {
             let func = match entry.as_import_symbol(image) {
-                exe::ImportSymbol::Name(name) => std::str::from_utf8(name).unwrap().to_string(),
+                // C++ libraries export mangled names -- MFC42 imports msvcrt's as
+                // "?terminate@@YAXXZ" -- and these become Rust paths, so the characters
+                // that are not identifier-legal are escaped rather than passed through.
+                // The escape is injective, so two distinct mangled names cannot collide.
+                exe::ImportSymbol::Name(name) => {
+                    let raw = std::str::from_utf8(name).unwrap();
+                    let mut out = String::with_capacity(raw.len());
+                    for (i, c) in raw.chars().enumerate() {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            if i == 0 && c.is_ascii_digit() {
+                                out.push('_');
+                            }
+                            out.push(c);
+                        } else {
+                            out.push_str(&format!("_x{:02x}", c as u32));
+                        }
+                    }
+                    out
+                }
                 exe::ImportSymbol::Ordinal(n) => format!("ordinal{n}"),
             };
             let data = is_data(name, &func);
