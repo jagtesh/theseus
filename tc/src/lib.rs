@@ -67,6 +67,9 @@ pub struct Import {
     pub addr: u32,
     /// when true, data, not code
     pub data: bool,
+    /// when true, bound to a linked module's export, so the translated code at
+    /// `addr` is the implementation and no host stub stands in for it
+    pub linked: bool,
 }
 
 pub enum Module {
@@ -143,6 +146,11 @@ pub struct AddrInfo {
 
 pub struct State {
     pub module: Module,
+    /// Additional modules loaded into the same address space, keyed by the name
+    /// an import refers to them by (lowercased, without extension). Their code is
+    /// translated alongside the main module's, so an import of one of them binds
+    /// to a real address rather than a synthetic one.
+    pub linked: Vec<(String, WindowsModule)>,
     pub mem: Memory,
     pub addr_info: HashMap<u32, AddrInfo>,
     pub blocks: HashMap<u32, Block>,
@@ -153,6 +161,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             module: Module::DOS(DOSModule::default()),
+            linked: Default::default(),
             mem: Default::default(),
             addr_info: Default::default(),
             blocks: Default::default(),
@@ -263,6 +272,7 @@ impl State {
                         iat_addr: addr,
                         addr: 0,
                         data: false,
+                        linked: false,
                     });
                     addr += 4;
                 }
@@ -296,6 +306,7 @@ impl State {
                     iat_addr: addr,
                     addr: 0,
                     data: false,
+                    linked: false,
                 });
                 addr += 4;
             }
@@ -303,6 +314,29 @@ impl State {
 
         addr
     }
+
+/// Bind an import to a linked module's export, if that module was supplied.
+/// Most of a DLL's exports are unnamed, so imports by ordinal are the common
+/// case: mfc42 names 6 of its 6,389.
+fn resolve_linked(linked: &[(String, WindowsModule)], import: &Import) -> Option<u32> {
+    let dll = import
+        .dll
+        .rsplit_once('.')
+        .map_or(import.dll.as_str(), |(stem, _)| stem)
+        .to_ascii_lowercase();
+    let (_, module) = linked.iter().find(|(name, _)| *name == dll)?;
+    let export = match import.func.strip_prefix("ordinal") {
+        Some(n) => {
+            let ordinal: u32 = n.parse().ok()?;
+            module.exports.iter().find(|e| e.ordinal == ordinal)?
+        }
+        None => module
+            .exports
+            .iter()
+            .find(|e| e.name.as_deref() == Some(import.func.as_str()))?,
+    };
+    Some(export.addr)
+}
 
     fn write_iat(&mut self, data_addr: u32) {
         let Module::Windows(module) = &mut self.module else {
@@ -314,7 +348,10 @@ impl State {
             if import.iat_addr == 0 {
                 panic!("{import:#x?}");
             }
-            if import.data {
+            if let Some(addr) = Self::resolve_linked(&self.linked, import) {
+                import.addr = addr;
+                import.linked = true;
+            } else if import.data {
                 import.addr = data_addr;
                 data_addr += 4;
             } else {

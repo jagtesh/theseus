@@ -36,8 +36,10 @@ fn load_dos(mem: &mut Memory, buf: &[u8], dos: exe::DOS) -> DOSModule {
     }
 }
 
-fn load_pe(mem: &mut Memory, buf: &[u8], f: exe::PE) -> WindowsModule {
-    mem.mappings.alloc("null page".into(), 0x1000);
+pub fn load_pe(mem: &mut Memory, buf: &[u8], f: exe::PE) -> WindowsModule {
+    if mem.mappings.vec().iter().all(|m| m.desc != "null page") {
+        mem.mappings.alloc("null page".into(), 0x1000);
+    }
 
     let image_base = f.opt_header.ImageBase;
     mem.reserve("exe header".into(), image_base, 0x1000);
@@ -180,8 +182,19 @@ fn read_imports(pe_file: &exe::PE, mem: &Memory) -> Vec<Import> {
                 iat_addr: image_base + addr,
                 addr: 0,
                 data,
+                linked: false,
             });
         }
     }
     imports
+}
+
+/// Load an additional PE into the same address space as the main module, so its
+/// code can be translated into the same block table. Windows DLLs carry distinct
+/// preferred bases, so nothing here relocates them.
+pub fn load_module(mem: &mut Memory, buf: Vec<u8>) -> anyhow::Result<WindowsModule> {
+    match exe::parse(&buf).unwrap() {
+        exe::Parse::PE(pe) => Ok(load_pe(mem, &buf, pe)),
+        exe::Parse::DOS(_) => anyhow::bail!("--link expects a PE module"),
+    }
 }

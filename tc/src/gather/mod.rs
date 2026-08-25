@@ -131,7 +131,7 @@ impl<'a> Traverse<'a> {
     fn run(&mut self) {
         if let Module::Windows(module) = self.module {
             for import in &module.imports {
-                if !import.data {
+                if !import.data && !import.linked {
                     let func = format!("{}::{}", import.dll, import.func);
                     self.blocks.insert(
                         import.addr,

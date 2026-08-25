@@ -59,6 +59,11 @@ struct Args {
     #[argh(switch)]
     exports: bool,
 
+    /// additional PE modules to translate into the same output, so imports of
+    /// them bind to translated code instead of a host implementation
+    #[argh(option)]
+    link: Vec<String>,
+
     /// additional addresses containing pointers to code
     #[argh(option, from_str_fn(parse_ip_range))]
     jump_table: Vec<std::ops::Range<IP>>,
@@ -113,6 +118,26 @@ fn run() -> anyhow::Result<()> {
         state.module = Module::DOS(tc::com::load_com(&mut state.mem, buf));
     } else if args.exe.to_ascii_lowercase().ends_with(".exe") {
         state.module = tc::exe::load_exe(&mut state.mem, buf);
+        for path in &args.link {
+            let name = std::path::Path::new(path)
+                .file_stem()
+                .ok_or_else(|| anyhow::anyhow!("--link {path}: no file name"))?
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let module = tc::exe::load_module(&mut state.mem, std::fs::read(path)?)?;
+            log::info!(
+                "linked {name}: {exports} exports at {base:#x}",
+                exports = module.exports.len(),
+                base = module.image_base,
+            );
+            state.linked.push((name, module));
+        }
+        if let (Module::Windows(main), false) = (&mut state.module, state.linked.is_empty()) {
+            for (_, module) in &state.linked {
+                main.exec_ranges.extend(module.exec_ranges.iter().cloned());
+            }
+            main.exec_ranges.sort_by_key(|r| r.start);
+        }
         state.init_imports();
     } else {
         anyhow::bail!("unexpected file extension");
@@ -146,6 +171,24 @@ fn run() -> anyhow::Result<()> {
             });
         }
     }
+    for (name, module) in &state.linked {
+        let mut code = 0;
+        let mut data = 0;
+        for export in &module.exports {
+            if state.module.exec_range(export.addr).is_none() {
+                data += 1;
+                continue;
+            }
+            code += 1;
+            entry_points.push(tc::EntryPoint::Single(IP::Flat(export.addr)));
+            state.addr_info.entry(export.addr).or_insert(AddrInfo {
+                name: format!("{name}_{}", export.ident()),
+                is_extern: false,
+            });
+        }
+        log::info!("{name}: seeded {code} exports, {data} in data");
+    }
+
     for ip in args.entry_point {
         if matches!(ip, IP::Seg(_)) != state.module.segment_addressed() {
             anyhow::bail!("--entry-point {ip} must be ip");

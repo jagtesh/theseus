@@ -541,15 +541,25 @@ regs.esp = {stack_pointer:#x};
             .blocks
             .get(&entry_point)
             .ok_or_else(|| anyhow!("entry point {entry_point:x} not found in parsed blocks"))?;
+        let image_end = self
+            .mem
+            .mappings
+            .vec()
+            .iter()
+            .map(|m| m.addr + m.size)
+            .max()
+            .unwrap_or(0);
         self.line(format!(
             "pub const EXEDATA: EXEData = EXEData {{
             image_base: {image_base:#x},
+            image_end: {image_end:#x},
             resources: {res_start:#x}..{res_end:#x},
             blocks: &BLOCKS,
             init,
             entry_point: Cont({entry_point}),
         }};\n\n",
             image_base = self.module.image_base(),
+            image_end = image_end,
             res_start = resources.start,
             res_end = resources.end,
             entry_point = entry_point.name(),

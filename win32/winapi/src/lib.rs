@@ -58,8 +58,9 @@ pub fn load(exe: &EXEData) -> Context {
     crate::trace::init(&host::trace_spec());
 
     // Room for the program's image, its heaps and the flat pool games of this
-    // era carve out for themselves.
-    let memory_size = 256 << 20;
+    // era carve out for themselves. A linked DLL sits at its own preferred base,
+    // far above the main image, so the floor has to clear that too.
+    let memory_size = (exe.image_end as usize + (64 << 20)).max(256 << 20);
     let mut memory = Memory::leak_new(memory_size);
 
     kernel32::init_state(exe.image_base, exe.resources.clone());

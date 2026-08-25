@@ -1,5 +1,10 @@
 use crate::codegen::{CodeGen, get_mem, instr_name, op_size};
 
+fn is_segment_register(r: iced_x86::Register) -> bool {
+    use iced_x86::Register::*;
+    matches!(r, CS | DS | ES | FS | GS | SS)
+}
+
 impl<'a> CodeGen<'a> {
     pub fn codegen_misc(&mut self, instr: &iced_x86::Instruction) -> bool {
         use iced_x86::Mnemonic::*;
@@ -23,7 +28,19 @@ impl<'a> CodeGen<'a> {
             }
             Pushad => self.line("ctx.pushad();"),
             Popad => self.line("ctx.popad();"),
-            Mov => self.line(self.set_op(instr, 0, self.get_op(instr, 1))),
+            Mov => {
+                let src = self.get_op(instr, 1);
+                // A segment register is 16 bits whatever the operand size says,
+                // so `mov ds, eax` narrows rather than being a same-width move.
+                let src = if is_segment_register(instr.op0_register())
+                    && crate::codegen::op_size(instr, 1) > 16
+                {
+                    format!("({src}) as u16")
+                } else {
+                    src
+                };
+                self.line(self.set_op(instr, 0, src))
+            }
 
             Sete | Setne | Setg | Setge | Setl | Setle | Seta | Setae | Setb | Setbe => {
                 self.line(self.set_op(instr, 0, format!("ctx.{}()", instr_name(instr))))
@@ -65,7 +82,7 @@ impl<'a> CodeGen<'a> {
             Enter => {
                 assert!(instr.op1_kind() == iced_x86::OpKind::Immediate8_2nd);
                 let op1 = instr.immediate8_2nd();
-                self.line(format!("ctx.enter({}, {:x});", self.get_op(instr, 0), op1));
+                self.line(format!("ctx.enter({}, {op1:#x}u8);", self.get_op(instr, 0)));
             }
 
             Xchg => {
