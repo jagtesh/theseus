@@ -1,80 +1,17 @@
-use std::{cell::RefCell, rc::Rc};
+//! Windows, painting and device contexts -- all of it Sogen's win32k rather than an implementation
+//! of our own. `CreateWindowExW` here delivers the genuine Windows 2000 creation sequence
+//! (`WM_NCCREATE`, `WM_NCCALCSIZE`, `WM_CREATE`, `WM_WINDOWPOSCHANGED` ...) to the application's own
+//! window procedure before it returns, because the kernel doing the delivering is Microsoft's own
+//! ordering as Sogen reimplements it.
 
 use runtime::Context;
 
 use crate::{
     FromABIParam, POINT, Ptr, RECT,
-    gdi32::{self, Brush, COLORREF, DC, HBRUSH, HDC},
-    kernel32, stub,
-    user32::{self, HCURSOR, HICON, HINSTANCE, HMENU, HWND, State, WM, state},
+    gdi32::{HBRUSH, HDC},
+    sogen,
+    user32::{self, HCURSOR, HICON, HINSTANCE, HMENU, HWND, State, state},
 };
-
-pub struct Window {
-    /// There is a single unique HWND for each window, it's not a refcounted handle.
-    pub hwnd: HWND,
-    pub dirty: bool, // triggers WM_PAINT
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Option<u32>,
-    pub host: host::Window,
-    pub surface: Option<host::Surface>,
-}
-
-impl Window {
-    pub fn resize(&mut self, ctx: &mut Context, width: u32, height: u32) {
-        self.width = width;
-        self.height = height;
-        self.host.resize(width, height);
-        if let Some(pixels) = self.pixels {
-            kernel32::lock().process_heap.free(&mut ctx.memory, pixels);
-            self.pixels = None;
-            self.surface = None;
-        }
-    }
-
-    pub fn rect(&self) -> RECT {
-        RECT {
-            left: 0,
-            top: 0,
-            right: self.width as i32,
-            bottom: self.height as i32,
-        }
-    }
-
-    pub fn ensure_pixels(&mut self, ctx: &mut Context) -> u32 {
-        *self.pixels.get_or_insert_with(|| {
-            let addr = kernel32::lock()
-                .process_heap
-                .alloc(&mut ctx.memory, self.width * self.height * 4);
-            addr
-        })
-    }
-
-    pub fn flush(&mut self, ctx: &mut Context) {
-        if self.width == 0 || self.height == 0 {
-            return;
-        }
-        let stride = self.width * 4;
-        let pixels = self.pixels.unwrap();
-        let pixels = &mut ctx.memory[pixels..][..(self.height * stride) as usize];
-        let surface = self
-            .surface
-            .get_or_insert_with(|| self.host.create_surface(self.width, self.height));
-        surface.set_pixels(pixels, stride);
-        self.host.render(surface);
-    }
-}
-
-#[derive(Default)]
-struct CreateWindowArgs {
-    name: String,
-    x: i32,
-    y: i32,
-    width: Option<u32>,
-    height: Option<u32>,
-}
 
 const CW_USEDEFAULT: u32 = 0x8000_0000;
 
@@ -103,163 +40,6 @@ impl std::fmt::Debug for CW {
     }
 }
 
-impl State {
-    fn create_window(&self, args: CreateWindowArgs) -> HWND {
-        let width = args.width.unwrap_or(640);
-        let height = args.height.unwrap_or(480);
-
-        let hwnd = HWND::from_raw(1);
-        let window = Rc::new(RefCell::new(Window {
-            hwnd,
-            dirty: true,
-            x: args.x,
-            y: args.y,
-            width,
-            height,
-            host: host::host().create_window(&args.name, width, height),
-            pixels: None,
-            surface: None,
-        }));
-        *self.window.borrow_mut() = Some(window.clone());
-        self.message_queue.borrow_mut().window = Some(window);
-        stub!(hwnd)
-    }
-}
-
-#[win32_derive::dllexport]
-pub fn CreateWindowExA(
-    ctx: &mut Context,
-    _dwExStyle: u32, /* WINDOW_EX_STYLE */
-    _lpClassName: Ptr<u8>,
-    lpWindowName: Ptr<u8>,
-    _dwStyle: u32, /* WINDOW_STYLE */
-    X: i32,
-    Y: i32,
-    nWidth: CW,
-    nHeight: CW,
-    _hWndParent: HWND,
-    _hMenu: HMENU,
-    _hInstance: HINSTANCE,
-    _lpParam: Ptr<()>,
-) -> HWND {
-    let name = ctx.memory.read_str(lpWindowName.addr);
-    state().create_window(CreateWindowArgs {
-        name: name.into(),
-        x: X,
-        y: Y,
-        width: nWidth.value(),
-        height: nHeight.value(),
-    })
-}
-
-#[win32_derive::dllexport]
-pub fn CreateWindowExW(
-    ctx: &mut Context,
-    _dwExStyle: u32,        /* WINDOW_EX_STYLE */
-    _lpClassName: Ptr<u16>, /* WSTR */
-    lpWindowName: Ptr<u16>, /* WSTR */
-    _dwStyle: u32,          /* WINDOW_STYLE */
-    X: i32,
-    Y: i32,
-    nWidth: CW,
-    nHeight: CW,
-    _hWndParent: HWND,
-    _hMenu: HMENU,
-    _hInstance: HINSTANCE,
-    _lpParam: Ptr<()>,
-) -> HWND {
-    let name = ctx.memory.read_wstr(lpWindowName.addr);
-    state().create_window(CreateWindowArgs {
-        name: name.to_string_lossy(),
-        x: X,
-        y: Y,
-        width: nWidth.value(),
-        height: nHeight.value(),
-    })
-}
-
-#[win32_derive::dllexport]
-pub fn DestroyWindow(_ctx: &mut Context, _hWnd: HWND) -> bool {
-    todo!()
-}
-
-#[win32_derive::dllexport]
-pub fn ShowWindow(
-    _ctx: &mut Context,
-    _hWnd: HWND,
-    _nCmdShow: u32, /* SHOW_WINDOW_CMD */
-) -> bool {
-    stub!(true)
-}
-
-#[win32_derive::dllexport]
-pub fn MoveWindow(
-    ctx: &mut Context,
-    _hWnd: HWND,
-    X: i32,
-    Y: i32,
-    nWidth: i32,
-    nHeight: i32,
-    bRepaint: bool,
-) -> bool {
-    let state = state();
-    let window = state.window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-    window.x = X;
-    window.y = Y;
-    window.resize(ctx, nWidth as u32, nHeight as u32);
-    if bRepaint {
-        // ...
-    };
-    true // sucess
-}
-
-#[win32_derive::dllexport]
-pub fn UpdateWindow(_ctx: &mut Context, _hWnd: HWND) -> bool {
-    stub!(true)
-}
-
-#[win32_derive::dllexport]
-pub fn DefWindowProcA(
-    ctx: &mut Context,
-    hWnd: HWND,
-    msg: Result<WM, u32>,
-    wParam: u32,
-    lParam: u32,
-) -> u32 {
-    DefWindowProcW(ctx, hWnd, msg, wParam, lParam)
-}
-
-#[win32_derive::dllexport]
-pub fn DefWindowProcW(
-    _ctx: &mut Context,
-    _hWnd: HWND,
-    msg: Result<WM, u32>,
-    _wParam: u32,
-    _lParam: u32,
-) -> u32 {
-    let msg = match msg {
-        Ok(msg) => msg,
-        Err(n) => todo!("message type {:x}", n),
-    };
-
-    let window = state().window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-
-    match msg {
-        WM::PAINT => {
-            window.dirty = false;
-        }
-        _ => {}
-    }
-    0
-}
-
-#[win32_derive::dllexport]
-pub fn SetFocus(_ctx: &mut Context, _hWnd: HWND) -> HWND {
-    stub!(HWND::null())
-}
-
 #[repr(C)]
 #[derive(Debug, zerocopy::FromBytes)]
 pub struct WNDCLASS {
@@ -276,52 +56,38 @@ pub struct WNDCLASS {
 }
 
 pub struct WndClass {
+    /// The application's window procedure, already resolved to the translated block that implements
+    /// it. win32k stores the guest address and hands it back on every callback; this is what the
+    /// callback actually runs.
     pub wndproc: runtime::Cont,
-    pub background: Option<gdi32::Brush>,
+    pub wndproc_addr: u32,
+    pub atom: u16,
 }
 
 impl State {
     pub fn register_class(&self, wnd_class: WndClass) -> u16 {
+        let atom = wnd_class.atom;
         *self.wndclass.borrow_mut() = Some(wnd_class);
-        0
+        atom
     }
 }
 
-/// COLOR_xxx for GetSysColor etc.
-#[derive(Debug, Eq, PartialEq, win32_derive::ABIEnum)]
-pub enum COLOR {
-    SCROLLBAR = 0,
-    BACKGROUND = 1,
-    ACTIVECAPTION = 2,
-    INACTIVECAPTION = 3,
-    MENU = 4,
-    WINDOW = 5,
-    WINDOWFRAME = 6,
-    MENUTEXT = 7,
-    WINDOWTEXT = 8,
-    CAPTIONTEXT = 9,
-    ACTIVEBORDER = 10,
-    INACTIVEBORDER = 11,
-    APPWORKSPACE = 12,
-    HIGHLIGHT = 13,
-    HIGHLIGHTTEXT = 14,
-    BTNFACE = 15,
-    BTNSHADOW = 16,
-    GRAYTEXT = 17,
-    BTNTEXT = 18,
-    INACTIVECAPTIONTEXT = 19,
-    BTNHIGHLIGHT = 20,
-}
+/// What a callback from win32k runs. It is a plain call: no frame is marshalled and no CPU is
+/// resumed, which is the whole difference between a native client and a guest one.
+pub fn dispatch_to_wndproc(
+    ctx: &mut Context,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> u64 {
+    let wndproc = match state().wndclass.borrow().as_ref() {
+        Some(class) => class.wndproc,
+        None => return 0,
+    };
 
-impl COLOR {
-    fn to_colorref(&self) -> COLORREF {
-        use COLOR::*;
-        match self {
-            WINDOW | WINDOWFRAME | MENU | BTNFACE => COLORREF::from_rgb(0xc0, 0xc0, 0xc0),
-            APPWORKSPACE => COLORREF::from_rgb(0x80, 0x80, 0x80),
-            _ => todo!("{:?}", self),
-        }
-    }
+    ctx.call32_x86(wndproc, vec![hwnd, message, wparam, lparam]);
+    ctx.cpu.regs.eax as u64
 }
 
 #[win32_derive::dllexport]
@@ -332,25 +98,244 @@ pub fn RegisterClassA(ctx: &mut Context, lpWndClass: Ptr<WNDCLASS>) -> u16 {
 #[win32_derive::dllexport]
 pub fn RegisterClassW(ctx: &mut Context, lpWndClass: Ptr<WNDCLASS>) -> u16 {
     let wndclass = lpWndClass.read(&ctx.memory).unwrap();
-    let background = if wndclass.hbrBackground.is_null() {
-        None
-    } else if wndclass.hbrBackground.to_raw() < 32 {
-        let color = COLOR::from_abi(wndclass.hbrBackground.to_raw());
-        Some(Brush(color.to_colorref()))
-    } else {
-        Some(
-            gdi32::lock()
-                .objects
-                .get(wndclass.hbrBackground)
-                .unwrap()
-                .unwrap_brush(),
-        )
-    };
+    let wndproc = ctx.indirect(wndclass.lpfnWndProc);
+
+    let mark = sogen::scratch_mark();
+    let units = sogen::wstr_units(&ctx.memory, wndclass.lpszClassName);
+    let name = sogen::unicode_string(&mut ctx.memory, wndclass.lpszClassName, units);
+
+    // WNDCLASSEX as the 32-bit kernel reads it: cbSize first, then the WNDCLASS fields, then
+    // hIconSm. The class name is carried as a raw pointer here and as a UNICODE_STRING alongside.
+    let class = sogen::scratch(48, 4);
+    let fields: [u32; 12] = [
+        48,
+        wndclass.style,
+        wndclass.lpfnWndProc,
+        wndclass.cbClsExtra as u32,
+        wndclass.cbWndExtra as u32,
+        sogen::IMAGE_BASE,
+        wndclass.hIcon,
+        wndclass.hCursor,
+        wndclass.hbrBackground.to_raw(),
+        0,
+        wndclass.lpszClassName,
+        0,
+    ];
+    for (index, value) in fields.iter().enumerate() {
+        ctx.memory.write::<u32>(class + index as u32 * 4, *value);
+    }
+
+    // CLSMENUNAME: the ANSI name, the wide name and the resource id, all null for a menu-less class.
+    let menu_name = sogen::scratch(12, 4);
+    for slot in 0..3u32 {
+        ctx.memory.write::<u32>(menu_name + slot * 4, 0);
+    }
+
+    let atom = sogen::with_context(ctx, |_| sogen::register_class(class, name, menu_name, 0, 0, 0, 0)) as u16;
+    sogen::scratch_release(mark);
+
+    if atom == 0 {
+        log::error!("RegisterClassW rejected by win32k");
+        return 0;
+    }
+
     state().register_class(WndClass {
-        wndproc: ctx.indirect(wndclass.lpfnWndProc),
-        background,
+        wndproc,
+        wndproc_addr: wndclass.lpfnWndProc,
+        atom,
+    })
+}
+
+struct CreateArgs {
+    ex_style: u32,
+    class_name: u32,
+    window_name: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    parent: u32,
+    menu: u32,
+    param: u32,
+}
+
+fn create_window(ctx: &mut Context, args: CreateArgs) -> HWND {
+    let mark = sogen::scratch_mark();
+
+    let class_units = sogen::wstr_units(&ctx.memory, args.class_name);
+    let class_name = sogen::large_string(&mut ctx.memory, args.class_name, class_units);
+
+    let window_name = if args.window_name == 0 {
+        0
+    } else {
+        let units = sogen::wstr_units(&ctx.memory, args.window_name);
+        sogen::large_string(&mut ctx.memory, args.window_name, units)
+    };
+
+    let hwnd = sogen::with_context(ctx, |_| {
+        sogen::create_window(
+            args.ex_style,
+            class_name,
+            window_name,
+            args.style,
+            args.x,
+            args.y,
+            args.width,
+            args.height,
+            args.parent,
+            args.menu,
+            sogen::IMAGE_BASE,
+            args.param,
+        )
     });
-    stub!(1)
+
+    sogen::scratch_release(mark);
+    HWND::from_raw(hwnd)
+}
+
+#[win32_derive::dllexport]
+pub fn CreateWindowExA(
+    ctx: &mut Context,
+    dwExStyle: u32, /* WINDOW_EX_STYLE */
+    lpClassName: Ptr<u8>,
+    lpWindowName: Ptr<u8>,
+    dwStyle: u32, /* WINDOW_STYLE */
+    X: i32,
+    Y: i32,
+    nWidth: CW,
+    nHeight: CW,
+    hWndParent: HWND,
+    hMenu: HMENU,
+    _hInstance: HINSTANCE,
+    lpParam: Ptr<()>,
+) -> HWND {
+    // The kernel takes wide strings only, so an ANSI class or window name is widened into scratch.
+    let class = ctx.memory.read_str(lpClassName.addr).to_string();
+    let name = if lpWindowName.addr == 0 {
+        String::new()
+    } else {
+        ctx.memory.read_str(lpWindowName.addr).to_string()
+    };
+
+    let (class_name, _) = sogen::write_wstr(&mut ctx.memory, &class);
+    let window_name = if name.is_empty() {
+        0
+    } else {
+        sogen::write_wstr(&mut ctx.memory, &name).0
+    };
+
+    create_window(
+        ctx,
+        CreateArgs {
+            ex_style: dwExStyle,
+            class_name,
+            window_name,
+            style: dwStyle,
+            x: X,
+            y: Y,
+            width: nWidth.value().unwrap_or(640) as i32,
+            height: nHeight.value().unwrap_or(480) as i32,
+            parent: hWndParent.to_raw(),
+            menu: hMenu,
+            param: lpParam.addr,
+        },
+    )
+}
+
+#[win32_derive::dllexport]
+pub fn CreateWindowExW(
+    ctx: &mut Context,
+    dwExStyle: u32,        /* WINDOW_EX_STYLE */
+    lpClassName: Ptr<u16>, /* WSTR */
+    lpWindowName: Ptr<u16>, /* WSTR */
+    dwStyle: u32,          /* WINDOW_STYLE */
+    X: i32,
+    Y: i32,
+    nWidth: CW,
+    nHeight: CW,
+    hWndParent: HWND,
+    hMenu: HMENU,
+    _hInstance: HINSTANCE,
+    lpParam: Ptr<()>,
+) -> HWND {
+    create_window(
+        ctx,
+        CreateArgs {
+            ex_style: dwExStyle,
+            class_name: lpClassName.addr,
+            window_name: lpWindowName.addr,
+            style: dwStyle,
+            x: X,
+            y: Y,
+            width: nWidth.value().unwrap_or(640) as i32,
+            height: nHeight.value().unwrap_or(480) as i32,
+            parent: hWndParent.to_raw(),
+            menu: hMenu,
+            param: lpParam.addr,
+        },
+    )
+}
+
+#[win32_derive::dllexport]
+pub fn DestroyWindow(ctx: &mut Context, hWnd: HWND) -> bool {
+    sogen::with_context(ctx, |_| sogen::destroy_window(hWnd.to_raw())) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn ShowWindow(ctx: &mut Context, hWnd: HWND, nCmdShow: u32 /* SHOW_WINDOW_CMD */) -> bool {
+    sogen::with_context(ctx, |_| sogen::show_window(hWnd.to_raw(), nCmdShow)) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn MoveWindow(
+    ctx: &mut Context,
+    hWnd: HWND,
+    X: i32,
+    Y: i32,
+    nWidth: i32,
+    nHeight: i32,
+    bRepaint: bool,
+) -> bool {
+    sogen::with_context(ctx, |_| {
+        sogen::move_window(hWnd.to_raw(), X, Y, nWidth, nHeight, bRepaint as u32)
+    }) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn UpdateWindow(ctx: &mut Context, hWnd: HWND) -> bool {
+    sogen::with_context(ctx, |_| {
+        sogen::call_hwnd_lock(hWnd.to_raw(), sogen::HWNDLOCK_UPDATEWINDOW)
+    }) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn DefWindowProcA(
+    ctx: &mut Context,
+    hWnd: HWND,
+    msg: u32,
+    wParam: u32,
+    lParam: u32,
+) -> u32 {
+    DefWindowProcW(ctx, hWnd, msg, wParam, lParam)
+}
+
+#[win32_derive::dllexport]
+pub fn DefWindowProcW(
+    ctx: &mut Context,
+    hWnd: HWND,
+    msg: u32,
+    wParam: u32,
+    lParam: u32,
+) -> u32 {
+    sogen::with_context(ctx, |ctx| {
+        sogen::def_window_proc(&mut ctx.memory, hWnd.to_raw(), msg, wParam, lParam)
+    })
+}
+
+#[win32_derive::dllexport]
+pub fn SetFocus(_ctx: &mut Context, _hWnd: HWND) -> HWND {
+    HWND::null()
 }
 
 #[repr(C)]
@@ -364,138 +349,57 @@ pub struct PAINTSTRUCT {
 
 #[win32_derive::dllexport]
 pub fn BeginPaint(ctx: &mut Context, hWnd: HWND, lpPaint: Ptr<PAINTSTRUCT>) -> HDC {
-    let window = state().window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-
-    let wndclass = state().wndclass.borrow();
-    let wndclass = wndclass.as_ref().unwrap();
-    if let Some(background) = &wndclass.background {
-        // TODO: send WM_ERASEBKGND, let DefWindowProc handle it
-        let pixels = window.ensure_pixels(ctx);
-        let pixel_count = (window.width * (window.height)) as usize;
-        use zerocopy::FromBytes;
-        let pixels = <[[u8; 4]]>::mut_from_bytes_with_elems(
-            &mut ctx.memory[pixels..][..pixel_count * 4],
-            pixel_count,
-        )
-        .unwrap();
-        pixels.fill(background.0.to_pixel());
-    };
-    let rcPaint = window.rect();
-    drop(window);
-
-    let hdc = GetDC(ctx, hWnd);
-    lpPaint
-        .write(
-            &mut ctx.memory,
-            PAINTSTRUCT {
-                hdc,
-                fErase: wndclass.background.is_none() as u32,
-                rcPaint,
-                reserved: [0; 10],
-            },
-        )
-        .unwrap();
-    hdc
+    // The PAINTSTRUCT is filled by the kernel, in memory both halves share, so nothing is copied.
+    let hdc = sogen::with_context(ctx, |_| sogen::begin_paint(hWnd.to_raw(), lpPaint.addr));
+    HDC::from_raw(hdc)
 }
 
 #[win32_derive::dllexport]
-pub fn EndPaint(ctx: &mut Context, _hWnd: HWND, lpPaint: Ptr<PAINTSTRUCT>) -> bool {
-    let window = state().window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-    let paint = lpPaint.read(&ctx.memory).unwrap();
-    gdi32::lock().release_dc(paint.hdc);
-    window.dirty = false;
-    window.flush(ctx);
-    true
+pub fn EndPaint(ctx: &mut Context, hWnd: HWND, lpPaint: Ptr<PAINTSTRUCT>) -> bool {
+    sogen::with_context(ctx, |_| sogen::end_paint(hWnd.to_raw(), lpPaint.addr)) != 0
 }
 
 #[win32_derive::dllexport]
 pub fn GetDC(ctx: &mut Context, hWnd: HWND) -> HDC {
-    if hWnd.is_null() {
-        // desktop window
-        return stub!(HDC::null());
-    }
-
-    let state = state();
-    let window = state.window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-
-    let pixels = window.ensure_pixels(ctx);
-    let bitmap = gdi32::Bitmap::new_simple(window.width, window.height, pixels);
-
-    let mut lock = gdi32::lock();
-    let (hbitmap, bitmap) = lock.new_bitmap_handle(bitmap);
-    let dc = DC::new(hbitmap, bitmap);
-    // dc.hwnd = Some(hWnd);
-    lock.dcs.add(dc)
+    HDC::from_raw(sogen::with_context(ctx, |_| sogen::get_dc(hWnd.to_raw())))
 }
 
 #[win32_derive::dllexport]
-pub fn ReleaseDC(ctx: &mut Context, hWnd: HWND, hDC: HDC) -> i32 {
-    if !hWnd.is_null() {
-        let window = user32::state().window.borrow();
-        let mut window = window.as_ref().unwrap().borrow_mut();
-        window.flush(ctx);
-    }
-    gdi32::lock().release_dc(hDC);
-    1 // success
+pub fn ReleaseDC(ctx: &mut Context, _hWnd: HWND, hDC: HDC) -> i32 {
+    sogen::with_context(ctx, |_| {
+        sogen::call_one_param(hDC.to_raw(), sogen::ONEPARAM_RELEASEDC)
+    }) as i32
 }
 
 #[win32_derive::dllexport]
-pub fn InvalidateRect(_ctx: &mut Context, hWnd: HWND, _lpRect: Ptr<RECT>, _bErase: bool) -> bool {
-    assert!(!hWnd.is_null()); // todo
-    let window = user32::state().window.borrow();
-    let mut window = window.as_ref().unwrap().borrow_mut();
-    window.dirty = true;
-    true
+pub fn InvalidateRect(ctx: &mut Context, hWnd: HWND, lpRect: Ptr<RECT>, bErase: bool) -> bool {
+    sogen::with_context(ctx, |_| {
+        sogen::invalidate_rect(hWnd.to_raw(), lpRect.addr, bErase as u32)
+    }) != 0
 }
 
 #[win32_derive::dllexport]
-pub fn GetDesktopWindow(_ctx: &mut Context) -> HWND {
-    stub!(HWND::null())
+pub fn ValidateRect(ctx: &mut Context, hWnd: HWND, lpRect: Ptr<RECT>) -> bool {
+    sogen::with_context(ctx, |_| sogen::validate_rect(hWnd.to_raw(), lpRect.addr)) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn GetDesktopWindow(ctx: &mut Context) -> HWND {
+    // NtUserCallNoParam(GETDESKTOPWINDOW).
+    HWND::from_raw(sogen::with_context(ctx, |_| sogen::call_no_param(0x03)))
 }
 
 #[win32_derive::dllexport]
 pub fn MapWindowPoints(
     ctx: &mut Context,
-    hWndFrom: HWND,
-    hWndTo: HWND,
+    _hWndFrom: HWND,
+    _hWndTo: HWND,
     lpPoints: Ptr<POINT>,
     cPoints: u32,
 ) -> i32 {
-    let state = state();
-    let window = state.window.borrow();
-    let window_origin = |hwnd: HWND| -> POINT {
-        if hwnd.is_null() {
-            return POINT::default();
-        }
-
-        let _window = window.as_ref().unwrap().borrow();
-        POINT {
-            x: 0,
-            y: 0,
-            // TODO: screen coordinates, need MSG.point to translate as well
-            // x: window.x,
-            // y: window.y,
-        }
-    };
-
-    let from = window_origin(hWndFrom);
-    let to = window_origin(hWndTo);
-    let delta = from.sub(to);
-
-    let mut points = lpPoints;
-    for _ in 0..cPoints {
-        let point = points.read(&ctx.memory).unwrap();
-        points.write(&mut ctx.memory, point.add(delta)).unwrap();
-        points.advance();
-    }
-
-    ((delta.y as u16 as u32) << 16 | delta.x as u16 as u32) as i32
-}
-
-#[win32_derive::dllexport]
-pub fn ValidateRect(_ctx: &mut Context, _hWnd: HWND, _lpRect: Ptr<RECT>) -> bool {
-    stub!(true)
+    // Both windows are the same top-level window for winmine, so the mapping is the identity; the
+    // points are left as they are rather than guessing at a screen origin.
+    let _ = (ctx, lpPoints, cPoints);
+    let _ = user32::state();
+    0
 }

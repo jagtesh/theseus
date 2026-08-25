@@ -607,6 +607,7 @@ dependencies = [
  "exe",
  "host",
  "log",
+ "logger",
  "runtime",
  "widestring",
  "win32-derive",

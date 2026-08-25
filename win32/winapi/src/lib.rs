@@ -17,6 +17,7 @@ mod point;
 mod ptr;
 mod rect;
 pub mod shell32;
+pub mod sogen;
 pub mod trace;
 pub mod user32;
 pub mod winmm;
@@ -47,11 +48,13 @@ fn thesesus_trace() -> String {
 }
 
 pub fn load(exe: &EXEData) -> Context {
-    host::init();
+    logger::init();
     crate::trace::init(&thesesus_trace());
 
-    let memory_size = 32 << 20;
-    let memory = Memory::leak_new(memory_size);
+    // Guest memory is Sogen's mapping rather than a buffer of our own, so a pointer this crate
+    // writes is the pointer win32k dereferences. The kernel owns the host window too, so host::init
+    // is not called: there is one UI backend in the process and it is the one win32k presents to.
+    let memory = Memory::new(sogen::boot());
 
     kernel32::init_state(exe.image_base, exe.resources.clone());
     let mut lock = kernel32::lock();

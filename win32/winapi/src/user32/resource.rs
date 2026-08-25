@@ -60,14 +60,8 @@ pub fn LoadImageA(
         log::warn!("LoadImage: resource not found");
         return HANDLE::null();
     };
-    let (mut bitmap, pixels) = gdi32::Bitmap::parse(buf);
-    assert_eq!(bitmap.width, cx);
-    assert_eq!(bitmap.height, cy);
-
-    let pixels = unsafe { pixels.as_ptr().offset_from_unsigned(ctx.memory.as_ptr()) };
-    bitmap.pixels = pixels as u32;
-
-    gdi32::lock().new_bitmap_handle(bitmap).0
+    let _ = (buf, cx, cy);
+    todo!("LoadImage bitmaps are not wired to win32k")
 }
 
 pub type HCURSOR = u32;

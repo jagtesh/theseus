@@ -529,14 +529,9 @@ pub mod IDirectDrawSurface7 {
     pub fn GetDC(ctx: &mut Context, this: u32, lphDC: u32) -> DD {
         let surfaces = state().surf.borrow_mut();
         let mut surface = surfaces.get(&this).unwrap().borrow_mut();
-        let pixels = surface.lock(&mut ctx.memory);
-        let dc = gdi32::lock().new_memory_dc(gdi32::Bitmap::new_simple(
-            surface.width,
-            surface.height,
-            pixels,
-        ));
-        ctx.memory.write(lphDC, dc.to_raw());
-        stub!(DD::OK)
+        let _ = surface.lock(&mut ctx.memory);
+        let _ = lphDC;
+        todo!("ddraw surface DCs are not wired to win32k")
     }
 
     #[win32_derive::dllexport]
@@ -605,7 +600,7 @@ pub mod IDirectDrawSurface7 {
     pub fn ReleaseDC(ctx: &mut Context, this: u32, hDC: HDC) -> DD {
         let surfaces = state().surf.borrow_mut();
         let mut surface = surfaces.get(&this).unwrap().borrow_mut();
-        gdi32::lock().release_dc(hDC);
+        let _ = hDC;
         surface.unlock(&mut ctx.memory);
         DD::OK
     }

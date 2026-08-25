@@ -1,21 +1,8 @@
-use std::sync::Arc;
-
 use runtime::Context;
 
-pub use crate::bitmap_format::Bitmap;
-use crate::{
-    HANDLE, Ptr,
-    gdi32::{self, HDC, Object, State},
-    kernel32,
-};
+use crate::{HANDLE, Ptr, gdi32::HDC, sogen};
 
-impl State {
-    pub fn new_bitmap_handle(&mut self, bitmap: Bitmap) -> (HBITMAP, Arc<Bitmap>) {
-        let bitmap = Arc::new(bitmap);
-        let hbitmap = self.objects.add(Object::Bitmap(bitmap.clone()));
-        (hbitmap, bitmap)
-    }
-}
+pub type HBITMAP = HANDLE;
 
 #[win32_derive::dllexport]
 pub fn BitBlt(
@@ -30,7 +17,9 @@ pub fn BitBlt(
     y1: i32,
     rop: u32, /* ROP_CODE */
 ) -> bool {
-    StretchBlt(ctx, hdc, x, y, cx, cy, hdcSrc, x1, y1, cx, cy, rop)
+    sogen::with_context(ctx, |_| {
+        sogen::bit_blt(hdc.to_raw(), x, y, cx, cy, hdcSrc.to_raw(), x1, y1, rop)
+    })
 }
 
 #[win32_derive::dllexport]
@@ -48,64 +37,18 @@ pub fn StretchBlt(
     hSrc: i32,
     rop: u32, /* ROP_CODE */
 ) -> bool {
-    assert_eq!(rop, 0xcc0020);
-
-    let state = gdi32::lock();
-    let dc_src = state.dcs.get(hdcSrc).unwrap();
-    let bmp_src = &dc_src.bitmap.1;
-
-    let dc_dst = state.dcs.get(hdcDest).unwrap();
-    let bmp_dst = &dc_dst.bitmap.1;
-    assert!(bmp_dst.is_simple());
-
-    let [pixels_src, pixels_dst] = ctx
-        .memory
-        .bytes
-        .get_disjoint_mut([bmp_src.pixels_range(), bmp_dst.pixels_range()])
-        .unwrap();
-
-    // stretching not implemented yet
+    // Sogen implements NtGdiStretchBlt, but winmine only ever blits 1:1, so the unscaled path is the
+    // one wired up; a genuine stretch would be a different service rather than this one lying.
     assert_eq!(wDest, wSrc);
     assert_eq!(hDest, hSrc);
-
-    let xSrc = xSrc as u32;
-    let ySrc = ySrc as u32;
-    let xDst = xDest as u32;
-    let yDst = yDest as u32;
-    let wSrc = wSrc as u32;
-    let hSrc = hSrc as u32;
-    let wDst = wDest as u32;
-    for y in 0..hDest as u32 {
-        let dst = &mut pixels_dst[(((yDst + y) * bmp_dst.stride()) + (xDst * 4)) as usize..]
-            [..wDst as usize * 4];
-        let y_src = ySrc + y;
-        bmp_src.read_pixels(
-            &pixels_src,
-            if bmp_src.is_bottom_up {
-                hSrc - y_src - 1
-            } else {
-                y_src
-            },
-            xSrc,
-            xSrc + wSrc,
-            dst,
-        );
-    }
-
-    true
+    BitBlt(ctx, hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, rop)
 }
 
-pub type HBITMAP = HANDLE;
-
 #[win32_derive::dllexport]
-pub fn CreateCompatibleBitmap(ctx: &mut Context, _hdc: HDC, cx: i32, cy: i32) -> HBITMAP {
-    let w = cx as u32;
-    let h = cy as u32;
-    let pixels = kernel32::lock()
-        .process_heap
-        .alloc(&mut ctx.memory, w * h * 4);
-    let bitmap = Bitmap::new_simple(w, h, pixels);
-    gdi32::lock().new_bitmap_handle(bitmap).0
+pub fn CreateCompatibleBitmap(ctx: &mut Context, hdc: HDC, cx: i32, cy: i32) -> HBITMAP {
+    HBITMAP::from_raw(sogen::with_context(ctx, |_| {
+        sogen::create_compatible_bitmap(hdc.to_raw(), cx as u32, cy as u32)
+    }))
 }
 
 #[win32_derive::dllexport]
@@ -124,45 +67,23 @@ pub fn SetDIBitsToDevice(
     lpbmi: Ptr<u8>, /* BITMAPINFO */
     ColorUse: u32,  /* DIB_USAGE */
 ) -> u32 {
-    let (bmp_src, _) = Bitmap::parse(&ctx.memory[lpbmi.addr..]);
-
-    assert_eq!(StartScan, 0);
-    assert_eq!(ColorUse, 0); // DIB_RGB_COLORS
-    assert_eq!(cLines, h); // why would these ever be different?
-
-    let state = gdi32::lock();
-    let dc_dst = state.dcs.get(hdc).unwrap();
-    let bmp_dst = &dc_dst.bitmap.1;
-    assert!(bmp_dst.is_simple());
-
-    let [pixels_src, pixels_dst] = ctx
-        .memory
-        .bytes
-        .get_disjoint_mut([
-            lpvBits.addr as usize..(lpvBits.addr + (h * bmp_src.stride())) as usize,
-            bmp_dst.pixels_range(),
-        ])
-        .unwrap();
-
-    // for i in (0..pixels_src.len()).step_by(bmp_src.stride() as usize) {
-    //     log::info!("{:x?}", &pixels_src[i..][..bmp_src.stride() as usize]);
-    // }
-
-    for y in 0..h {
-        let dst = &mut pixels_dst[((yDest + y) * bmp_dst.stride() + xDest * 4) as usize..];
-        let y_src = ySrc + y;
-        bmp_src.read_pixels(
-            pixels_src,
-            if bmp_src.is_bottom_up {
-                h - y_src - 1
-            } else {
-                y_src
-            },
-            xSrc,
-            xSrc + w,
-            dst,
-        );
-    }
-
-    cLines
+    // The bits and the BITMAPINFO are already at guest addresses the kernel can read -- they are in
+    // winmine's own .rsrc -- so nothing is copied across the boundary.
+    sogen::with_context(ctx, |_| {
+        sogen::set_dibits_to_device(
+            hdc.to_raw(),
+            xDest as i32,
+            yDest as i32,
+            w,
+            h,
+            xSrc as i32,
+            ySrc as i32,
+            StartScan,
+            cLines,
+            lpvBits.addr,
+            lpbmi.addr,
+            ColorUse,
+            0,
+        )
+    })
 }

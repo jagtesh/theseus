@@ -1,6 +1,8 @@
-use std::sync::Mutex;
+//! GDI, served by Sogen's win32k. Every handle here is the kernel's own GDI handle, and the DC state
+//! that never reaches the kernel on Windows -- the selected brush, the current position, the ROP2 --
+//! is written into the DC's attribute block exactly as the real gdi32 writes it.
 
-use crate::{ABIReturn, FromABIParam, HANDLE, handle::Handles, locked_state::LockedState};
+use crate::{ABIReturn, FromABIParam, HANDLE};
 
 mod bitmap;
 pub use bitmap::*;
@@ -15,22 +17,6 @@ pub type HGDIOBJ = HANDLE;
 pub type HBRUSH = HGDIOBJ;
 pub type HPEN = HGDIOBJ;
 
-pub struct State {
-    pub dcs: Handles<DC>,
-    pub objects: Handles<Object>,
-}
-
-static STATE: Mutex<Option<State>> = Mutex::new(None);
-
-pub type Lock = LockedState<State>;
-pub fn lock() -> Lock {
-    LockedState::from_or_init(&STATE, || State {
-        // avoid low-numbered object handles to avoid conflicting with COLOR_* constants for HBRUSH
-        objects: Handles::new(0x1000),
-        dcs: Default::default(),
-    })
-}
-
 #[derive(Debug, Copy, Clone, Default)]
 pub struct COLORREF(u32);
 
@@ -40,9 +26,9 @@ impl FromABIParam for COLORREF {
     }
 }
 
-impl Into<ABIReturn> for COLORREF {
-    fn into(self) -> ABIReturn {
-        ABIReturn::from(self.0)
+impl From<COLORREF> for ABIReturn {
+    fn from(value: COLORREF) -> Self {
+        ABIReturn::from(value.0)
     }
 }
 

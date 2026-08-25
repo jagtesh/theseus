@@ -1,13 +1,13 @@
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::LazyLock};
+//! The message loop, served by Sogen's win32k.
+//!
+//! The queue, the hit-testing that turns a host mouse event into WM_NCHITTEST/WM_MOUSEMOVE, and the
+//! dispatch back into the window procedure are all the kernel's. Nothing here models a message.
+
+use std::sync::LazyLock;
 
 use runtime::Context;
 
-use crate::{
-    POINT, Ptr,
-    dllexport::win32flags,
-    stub, trace,
-    user32::{HACCEL, HWND, Window, state},
-};
+use crate::{POINT, Ptr, sogen, stub, trace, user32::{HACCEL, HWND}};
 
 /// If THESEUS_TRACE includes "wm", log all Windows messages.
 static LOG_MESSAGES: LazyLock<bool> =
@@ -40,248 +40,23 @@ pub struct MSG {
     pt: POINT,
 }
 
-#[derive(Default)]
-pub struct MessageQueue {
-    pub window: Option<Rc<RefCell<Window>>>,
-    messages: VecDeque<MSG>,
-    quit: Option<MSG>,
-}
+const PM_REMOVE: u32 = 1;
 
-win32flags! {
-    pub struct MK {
-        const LBUTTON = 0x0001;
-        const RBUTTON = 0x0002;
-        const SHIFT   = 0x0004;
-        const CONTROL = 0x0008;
-        const MBUTTON = 0x0010;
-    }
-}
+/// The kernel's GetMessage parks the calling thread until a message arrives, and a native client has
+/// no scheduler to park on. Polling PeekMessage is the same observable sequence without the block.
+fn wait_for_message(ctx: &mut Context, msg_addr: u32, hWnd: HWND, remove: u32) -> bool {
+    loop {
+        sogen::pump();
+        let got = sogen::with_context(ctx, |_| {
+            sogen::peek_message(msg_addr, hWnd.to_raw(), 0, 0, remove)
+        });
 
-fn mouse_button_to_wm(is_down: bool, message: &host::MouseMessage) -> WM {
-    // Can't use a match here because MouseButton is a bitfield, not an enum.
-    if message.button == host::MouseButton::Left {
-        if is_down {
-            return WM::LBUTTONDOWN;
-        } else {
-            return WM::LBUTTONUP;
-        }
-    } else if message.button == host::MouseButton::Right {
-        if is_down {
-            return WM::RBUTTONDOWN;
-        } else {
-            return WM::RBUTTONUP;
-        }
-    } else if message.button == host::MouseButton::Middle {
-        if is_down {
-            return WM::MBUTTONDOWN;
-        } else {
-            return WM::MBUTTONUP;
-        }
-    } else {
-        return WM::MOUSEMOVE;
-    }
-}
-
-fn mouse_msg(wm: WM, hwnd: HWND, message: &host::MouseMessage) -> MSG {
-    let mut wParam = MK::empty();
-    if message.buttons.contains(host::MouseButton::Left) {
-        wParam |= MK::LBUTTON;
-    }
-    if message.buttons.contains(host::MouseButton::Middle) {
-        wParam |= MK::MBUTTON;
-    }
-    if message.buttons.contains(host::MouseButton::Right) {
-        wParam |= MK::RBUTTON;
-    }
-
-    MSG {
-        hwnd,
-        message: wm as u32,
-        wParam: wParam.bits(),
-        lParam: (message.y as u16 as u32) << 16 | message.x as u16 as u32,
-        time: 0, // todo
-        // TODO: screen coordinates
-        pt: POINT {
-            x: message.x as i32,
-            y: message.y as i32,
-        },
-    }
-}
-
-impl MessageQueue {
-    fn paint_msg(&self) -> Option<MSG> {
-        let window = self.window.as_ref()?.borrow();
-        if !window.dirty {
-            return None;
+        if got != 0 {
+            return true;
         }
 
-        Some(MSG {
-            hwnd: window.hwnd,
-            message: WM::PAINT as u32,
-            wParam: 0,
-            lParam: 0,
-            time: 0,
-            pt: POINT::default(),
-        })
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
-
-    fn peek(&mut self) -> Option<MSG> {
-        if let Some(msg) = self.messages.front() {
-            Some(*msg)
-        } else if self.quit.is_some() {
-            self.quit
-        } else {
-            self.paint_msg()
-        }
-    }
-
-    fn pop(&mut self) -> Option<MSG> {
-        if let Some(msg) = self.messages.pop_front() {
-            Some(msg)
-        } else if self.quit.is_some() {
-            self.quit.take()
-        } else {
-            self.paint_msg()
-        }
-    }
-
-    /// Pop one message, waiting for a new one if necessary.
-    fn read(&mut self) -> MSG {
-        loop {
-            if let Some(msg) = self.pop() {
-                return msg;
-            }
-            self.wait_host();
-        }
-    }
-
-    /// Read one pending host message, if any available.
-    fn poll_host(&mut self) {
-        let Some(message) = host::host().poll() else {
-            return;
-        };
-        self.enqueue_message(message);
-    }
-
-    /// Wait for a new message to arrive.
-    fn wait_host(&mut self) {
-        let message = host::host().wait();
-        self.enqueue_message(message);
-    }
-
-    fn enqueue_message(&mut self, msg: host::Message) {
-        #[cfg(not(target_family = "wasm"))]
-        if matches!(msg, host::Message::Paint) {
-            if let Some(window) = &self.window {
-                window.borrow_mut().dirty = true;
-            }
-            return;
-        }
-
-        let msg = self.msg_from_message(msg);
-        if *LOG_MESSAGES {
-            log::info!("{:#x?}", msg);
-        }
-
-        // PAINT/TIMER/QUIT are in special queues.
-        if msg.message == WM::QUIT as u32 {
-            self.quit = Some(msg);
-        } else {
-            self.messages.push_back(msg);
-        }
-    }
-
-    fn msg_from_message(&self, message: host::Message) -> MSG {
-        use host::Message::*;
-        let hwnd = self.window.as_ref().unwrap().borrow().hwnd;
-        match message {
-            MouseDown(mouse) => mouse_msg(mouse_button_to_wm(true, &mouse), hwnd, &mouse),
-            MouseUp(mouse) => mouse_msg(mouse_button_to_wm(false, &mouse), hwnd, &mouse),
-            MouseMove(mouse) => mouse_msg(WM::MOUSEMOVE, hwnd, &mouse),
-            #[cfg(not(target_family = "wasm"))]
-            Paint => unreachable!(),
-            #[cfg(not(target_family = "wasm"))]
-            Quit => {
-                MSG {
-                    hwnd,
-                    message: WM::QUIT as u32,
-                    wParam: 0, // todo
-                    lParam: 0, // todo
-                    time: 0,   // todo
-                    pt: POINT::default(),
-                }
-            }
-        }
-    }
-}
-
-#[win32_derive::dllexport]
-pub fn DispatchMessageA(ctx: &mut Context, lpMsg: Ptr<MSG>) -> u32 {
-    DispatchMessageW(ctx, lpMsg)
-}
-
-#[win32_derive::dllexport]
-pub fn DispatchMessageW(ctx: &mut Context, lpMsg: Ptr<MSG>) -> u32 {
-    let wndproc = state().wndclass.borrow().as_ref().unwrap().wndproc.clone();
-    let msg = lpMsg.read(&ctx.memory).unwrap();
-    // WNDPROC
-    ctx.call32_x86(
-        wndproc,
-        vec![msg.hwnd.to_raw(), msg.message, msg.wParam, msg.lParam],
-    );
-    0
-}
-
-#[win32_derive::dllexport]
-pub fn TranslateMessage(_ctx: &mut Context, _lpMsg: Ptr<MSG>) -> bool {
-    false // no translation
-}
-
-#[win32_derive::dllexport]
-pub fn PeekMessageA(
-    ctx: &mut Context,
-    lpMsg: Ptr<MSG>,
-    hWnd: HWND,
-    _wMsgFilterMin: u32,
-    _wMsgFilterMax: u32,
-    wRemoveMsg: u32, /* PEEK_MESSAGE_REMOVE_TYPE */
-) -> bool {
-    let remove = match wRemoveMsg {
-        0 => false,   // PM_NOREMOVE
-        1 => true,    // PM_REMOVE
-        _ => todo!(), // e.g. PM_NOYIELD
-    };
-    let mut queue = state().message_queue.borrow_mut();
-    queue.poll_host();
-    let Some(msg) = queue.peek() else {
-        return false;
-    };
-
-    if hWnd.is_null() {
-    } else if hWnd.is_invalid() {
-        // TODO: only null hwnd messages
-        assert!(msg.hwnd.is_null());
-    } else {
-        // TODO: only matching messages
-        assert_eq!(msg.hwnd, hWnd);
-    }
-    lpMsg.write(&mut ctx.memory, msg).unwrap();
-    if remove {
-        queue.pop();
-    }
-    true
-}
-
-#[win32_derive::dllexport]
-pub fn PeekMessageW(
-    ctx: &mut Context,
-    lpMsg: Ptr<MSG>,
-    hWnd: HWND,
-    wMsgFilterMin: u32,
-    wMsgFilterMax: u32,
-    wRemoveMsg: u32, /* PEEK_MESSAGE_REMOVE_TYPE */
-) -> bool {
-    PeekMessageA(ctx, lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
 }
 
 #[win32_derive::dllexport]
@@ -303,22 +78,59 @@ pub fn GetMessageW(
     _wMsgFilterMin: u32,
     _wMsgFilterMax: u32,
 ) -> i32 {
-    let msg = state().message_queue.borrow_mut().read();
-    if msg.message == WM::QUIT as u32 {
-        return 0;
+    let msg_addr = lpMsg.addr;
+    wait_for_message(ctx, msg_addr, hWnd, PM_REMOVE);
+
+    let message = ctx.memory.read::<u32>(msg_addr + 4);
+    if *LOG_MESSAGES {
+        log::info!("GetMessage -> {message:#x}");
     }
 
-    if hWnd.is_null() {
-    } else if hWnd.is_invalid() {
-        // TODO: only null hwnd messages
-        assert!(msg.hwnd.is_null());
-    } else {
-        // TODO: only matching messages
-        assert_eq!(msg.hwnd, hWnd);
-    }
-    lpMsg.write(&mut ctx.memory, msg).unwrap();
+    if message == WM::QUIT as u32 { 0 } else { 1 }
+}
 
-    1 // no error, no WM_QUIT
+#[win32_derive::dllexport]
+pub fn PeekMessageA(
+    ctx: &mut Context,
+    lpMsg: Ptr<MSG>,
+    hWnd: HWND,
+    _wMsgFilterMin: u32,
+    _wMsgFilterMax: u32,
+    wRemoveMsg: u32, /* PEEK_MESSAGE_REMOVE_TYPE */
+) -> bool {
+    sogen::pump();
+    sogen::with_context(ctx, |_| {
+        sogen::peek_message(lpMsg.addr, hWnd.to_raw(), 0, 0, wRemoveMsg)
+    }) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn PeekMessageW(
+    ctx: &mut Context,
+    lpMsg: Ptr<MSG>,
+    hWnd: HWND,
+    wMsgFilterMin: u32,
+    wMsgFilterMax: u32,
+    wRemoveMsg: u32,
+) -> bool {
+    PeekMessageA(ctx, lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
+}
+
+#[win32_derive::dllexport]
+pub fn TranslateMessage(ctx: &mut Context, lpMsg: Ptr<MSG>) -> bool {
+    sogen::with_context(ctx, |_| sogen::translate_message(lpMsg.addr, 0)) != 0
+}
+
+#[win32_derive::dllexport]
+pub fn DispatchMessageA(ctx: &mut Context, lpMsg: Ptr<MSG>) -> u32 {
+    DispatchMessageW(ctx, lpMsg)
+}
+
+#[win32_derive::dllexport]
+pub fn DispatchMessageW(ctx: &mut Context, lpMsg: Ptr<MSG>) -> u32 {
+    // The kernel routes this to the window procedure through the client callback, which lands back
+    // in this process as an ordinary call.
+    sogen::with_context(ctx, |_| sogen::dispatch_message(lpMsg.addr))
 }
 
 #[win32_derive::dllexport]
@@ -328,12 +140,13 @@ pub fn TranslateAcceleratorW(
     _hAccTable: HACCEL,
     _lpMsg: Ptr<MSG>,
 ) -> i32 {
-    stub!(0) // no translation
+    stub!(0) // no accelerator table is built, so nothing translates
 }
 
 #[win32_derive::dllexport]
-pub fn PostQuitMessage(_ctx: &mut Context, _nExitCode: i32) {
-    todo!()
+pub fn PostQuitMessage(ctx: &mut Context, nExitCode: i32) {
+    // NtUserCallOneParam(exit code, POSTQUITMESSAGE).
+    sogen::with_context(ctx, |_| sogen::call_one_param(nExitCode as u32, 51));
 }
 
 #[win32_derive::dllexport]
@@ -344,16 +157,19 @@ pub fn PostMessageW(
     _wParam: WPARAM,
     _lParam: LPARAM,
 ) -> bool {
-    todo!()
+    stub!(true)
 }
 
 #[win32_derive::dllexport]
 pub fn SendMessageW(
-    _ctx: &mut Context,
-    _hWnd: HWND,
-    _Msg: u32,
-    _wParam: WPARAM,
-    _lParam: LPARAM,
+    ctx: &mut Context,
+    hWnd: HWND,
+    Msg: u32,
+    wParam: WPARAM,
+    lParam: LPARAM,
 ) -> u32 {
-    todo!()
+    // FNID_SENDMESSAGE.
+    sogen::with_context(ctx, |_| {
+        sogen::message_call(hWnd.to_raw(), Msg, wParam, lParam, 0, 0x2B1, 0)
+    })
 }
