@@ -151,6 +151,17 @@ impl Context {
         self.indirect(segofs(cs, ip))
     }
 
+    /// Far return in 32-bit mode. Both the offset and the selector are pushed as
+    /// dwords. Under the flat model every code segment is based at 0, so the
+    /// restored selector does not change how the offset is resolved.
+    pub fn retf32(&mut self, n: u16) -> Cont {
+        let eip = self.pop32();
+        let cs = self.pop32();
+        self.cpu.regs.set_cs(cs as u16);
+        self.cpu.regs.esp += n as u32;
+        self.indirect(eip)
+    }
+
     pub fn retf16(&mut self, n: u16) -> Cont {
         let ip = self.pop16();
         let cs = self.pop16();

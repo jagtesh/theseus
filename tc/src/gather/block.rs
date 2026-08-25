@@ -240,7 +240,10 @@ impl<'a, 'b> BlockDecoder<'a, 'b> {
                     self.traverse.queue.enqueue(ip);
                 }
                 Syscall | Sysexit | Sysret => anyhow::bail!("syscall not implemented"),
-                _ => todo!("{ip} control flow {}", instr),
+                // Scanning is heuristic and will land in data, where anything can
+                // decode; a block we cannot follow is not code, so drop it rather
+                // than ending the run.
+                _ => anyhow::bail!("unsupported control flow {}", instr),
             }
             break;
         }

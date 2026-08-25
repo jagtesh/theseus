@@ -79,15 +79,6 @@ impl<'a> CodeGen<'a> {
     pub fn gen_addr_offset(&self, instr: &iced_x86::Instruction) -> String {
         use iced_x86::Register::*;
         let mut expr = Vec::new();
-        if !self.module.segment_addressed() {
-            // 16-bit segments handled in gen_addr(), not here
-            match instr.memory_segment() {
-                CS | DS | ES | GS | SS => {}
-                FS => expr.push(format!("ctx.cpu.regs.fs_base")),
-                None => {}
-                r => todo!("{r:?} in {instr}"),
-            }
-        }
         match instr.memory_base() {
             None => {}
             r => expr.push(get_reg(r)),
@@ -105,7 +96,7 @@ impl<'a> CodeGen<'a> {
         }
         let offset = instr.memory_displacement32();
         if offset != 0 || expr.is_empty() {
-            expr.push(format!("{offset:#x}u{}", self.module.bitness()));
+            expr.push(format!("{offset:#x}u{}", self.addr_bits(instr)));
         }
 
         expr.into_iter()
@@ -121,10 +112,22 @@ impl<'a> CodeGen<'a> {
             .join("")
     }
 
+    /// Width the effective address is computed in. An address-size prefix lets a
+    /// 32-bit instruction address through 16-bit registers, in which case the sum
+    /// wraps within 16 bits before it is used, so the displacement has to be
+    /// narrow too or the terms will not combine.
+    fn addr_bits(&self, instr: &iced_x86::Instruction) -> u32 {
+        match (instr.memory_base(), instr.memory_index()) {
+            (iced_x86::Register::None, iced_x86::Register::None) => self.module.bitness(),
+            (iced_x86::Register::None, r) | (r, _) => reg_size(r) as u32,
+        }
+    }
+
     /// Codegen the absolute address found in an instruction that has a memory reference.
     /// Even for 16-bit code we generate a 32-bit memory address, because the computed
     /// address can go beyond a 16-bit address range.
     pub fn gen_addr(&self, instr: &iced_x86::Instruction) -> String {
+        use iced_x86::Register::*;
         let addr = self.gen_addr_offset(instr);
         if self.module.segment_addressed() {
             // The above offset expression will be a u16 in real mode.
@@ -134,7 +137,18 @@ impl<'a> CodeGen<'a> {
                 seg = reg_name(instr.memory_segment())
             )
         } else {
-            addr
+            // Widen before the segment base is applied: an address-size prefix
+            // wraps the offset within 16 bits, but fs_base is a linear address.
+            let addr = if self.addr_bits(instr) < self.module.bitness() {
+                format!("({addr}) as u{}", self.module.bitness())
+            } else {
+                addr
+            };
+            match instr.memory_segment() {
+                FS => format!("ctx.cpu.regs.fs_base.wrapping_add({addr})"),
+                CS | DS | ES | GS | SS | None => addr,
+                r => todo!("{r:?} in {instr}"),
+            }
         }
     }
 }
