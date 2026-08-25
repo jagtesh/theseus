@@ -62,6 +62,18 @@ impl<'a> Memory<'a> {
             .unwrap();
     }
 
+    pub fn read_f80(&self, addr: u32) -> f64 {
+        self.check_access(addr);
+        let addr = addr as usize;
+        crate::fpu::f80_to_f64(self.bytes[addr..addr + 10].try_into().unwrap())
+    }
+
+    pub fn write_f80(&mut self, addr: u32, val: f64) {
+        self.check_access(addr);
+        let addr = addr as usize;
+        self.bytes[addr..addr + 10].copy_from_slice(&crate::fpu::f64_to_f80(val));
+    }
+
     pub fn read_str(&self, addr: u32) -> &str {
         self.check_access(addr);
         let buf = &self.bytes[addr as usize..];
